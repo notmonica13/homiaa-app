@@ -1,0 +1,262 @@
+# MVP Plan for Cleaning & Babysitting Marketplace (Romania)
+
+## Overview
+
+This document outlines the minimal viable product (MVP) design for a two‑sided marketplace connecting customers with cleaning and babysitting providers in Romania.  The MVP must launch within **12 weeks** on a budget of **≤ €1,000**, with an architecture that can scale to other currencies and countries after launch.  Key business rules include:
+
+* **Default currency**: Romanian Leu (RON); multi‑currency support is disabled at MVP but the data model uses currency codes for future expansion.
+* **Languages**: Romanian with English fallback; additional languages added post‑MVP.
+* **Payout delay**: customer funds are held in escrow for **7 days** before being released to providers via Stripe Connect【670833047180860†L96-L114】.
+* **Provider eligibility**: providers must be ≥ 18 years old and pass identity verification (ID + selfie) and submit a clean *cazier* (criminal record) before listing services【880912946778135†L72-L97】.【163070271008718†L48-L53】  Under‑18 applicants are hard‑blocked.
+* **Payments & refunds**: customers pay at booking; refunds are permitted within the 7‑day pre‑payout window.  VAT is **not** charged at MVP and will be added after VAT registration.
+* **Admin & T&S**: the platform must provide dashboards for verifying providers, handling disputes, issuing refunds, managing payouts, and responding to SOS incidents.
+* **GDPR compliance**: all personal data and sensitive documents (IDs, selfies, *cazier*) must be stored securely and processed only as necessary.
+
+The following sections describe the system architecture, user flows, backlog, roadmap, vendor integration plan, security checklist, and scaling strategy.
+
+## System Architecture
+
+The architecture uses managed services to reduce cost and complexity.  Cloudflare Pages and Workers host the web frontend and API functions.  The mobile app is built with Expo and uses Supabase for authentication, database, storage and serverless functions.  Stripe handles payments, escrow and Connect payouts; Stripe Identity (or Sumsub) performs KYC/age verification.  Firebase Cloud Messaging (FCM) sends push notifications; Resend sends transactional emails; PostHog records analytics and feature flags; Mapbox provides maps and estimated arrival; hCaptcha defends against bots.  Admin dashboards live on Supabase or Cloudflare and use PostHog for analytics.
+
+Below is an ASCII diagram showing high‑level interactions:
+
+```
+                 +--------------------+            +------------------+
+                 |   Customer App     |            | Provider App     |
+                 | (Expo/React Native)|            | (Expo/React)     |
+                 +---------+----------+            +---------+--------+
+                           |                                 |
+                           |  HTTPS calls & websockets       |
+                           v                                 v
+                 +----------------------------------------------+
+                 |        Frontend (Cloudflare Pages)           |
+                 +----------------------------------------------+
+                           |                                 |
+                           v                                 v
+             +------------------------------------------------------+
+             |                   Supabase Backend                   |
+             |  - Supabase Auth (email/phone/OAuth)                 |
+             |  - Postgres DB & storage for user, booking, etc.     |
+             |  - Edge Functions (business logic, Cron jobs)        |
+             +------------------------------------------------------+
+                           |       |           |              |
+             ---------------       |           |              --------------
+            |                     |           |                              |
+            v                     v           v                              v
+   +------------------+  +-----------------+ +--------------------+ +------------------+
+   | Stripe Payments & |  | Stripe Identity | |    Mapbox API     | |    PostHog      |
+   |  Connect (escrow) |  | or Sumsub KYC   | | (Maps & ETA)      | | (Analytics &    |
+   |  (7‑day payout)   |  | (ID + selfie)   | |                   | | Feature Flags)  |
+   +------------------+  +-----------------+ +--------------------+ +------------------+
+            |                     |                    |                    |
+            v                     v                    v                    v
+    +--------------------------------------------------------------------------+
+    |                   Notification & Communication Layer                    |
+    |   - Firebase FCM (push)  - Resend (email)  - hCaptcha (bot defence)     |
+    +--------------------------------------------------------------------------+
+                                      |
+                                      v
+                     +-------------------------------------------+
+                     |         Admin & T&S Dashboards            |
+                     |  - KYC & *cazier* review                  |
+                     |  - Disputes & refunds                     |
+                     |  - Payout and escrow monitoring           |
+                     |  - SOS/incident management                |
+                     +-------------------------------------------+
+```
+
+### Data Flow Highlights
+
+* **Sign‑up & verification** – Customers and providers sign up via Supabase Auth.  Providers trigger a KYC workflow via Stripe Identity or Sumsub to verify age and match their ID with a selfie【880912946778135†L72-L97】.  Providers upload their *cazier* which is stored in Supabase and reviewed by the admin.
+* **Booking & payments** – Customers browse providers, select a service, and create a booking request.  A Stripe Payment Intent is created, charging the customer immediately and placing funds in a 7‑day escrow.  Upon job completion, a review period starts; after 7 days the platform releases the payout to the provider’s Stripe Connect account【670833047180860†L96-L114】.
+* **Refunds** – Customers can request a refund during the 7‑day escrow.  Admins handle disputes via the dashboard; refunds are processed through Stripe.
+* **Notifications** – FCM sends push notifications for booking status, messages and reviews; Resend handles transactional emails (verification, receipts, dispute updates).  hCaptcha protects sign‑up and booking forms【344031017633751†L20-L31】.
+* **Analytics & feature flags** – PostHog tracks events (bookings, cancellations, conversions) and manages feature flags for controlled rollouts.  Data retention is one year in the free plan【224060230915803†L44-L99】.
+* **Admin & T&S** – Admin dashboards show pending KYC submissions, flagged *cazier* documents, disputes, payout status, refund requests and incident reports.  Only authorised admin users can access this interface.
+
+## End‑to‑End User Flows
+
+### Customer Flow
+
+1. **Account creation** – The customer signs up using email, phone or OAuth via Supabase Auth.  Optional: verify email via Resend.
+2. **Search & discover** – Browse or search for providers by service type, availability, price and ratings; filter by location using Mapbox.
+3. **Request booking** – Choose a provider, pick date and time, add details, complete payment via Stripe.  Funds are held in escrow.
+4. **Receive confirmation** – Provider accepts or declines within a configurable window; customer receives push/email notifications.
+5. **Service & review** – On the scheduled date the provider delivers the service.  Customer marks the job complete and leaves a rating/review.  Funds remain in escrow for 7 days.
+6. **Refund or release** – During the 7‑day window the customer may request a refund; otherwise the payout is automatically released to the provider.  Customer can raise disputes via the help centre.
+
+### Provider Flow (18+ only)
+
+1. **Account creation & KYC** – Provider signs up; begins identity verification with Stripe Identity or Sumsub (upload government ID + selfie).  The system extracts the date of birth and confirms the user is ≥ 18【163070271008718†L48-L53】.  Providers upload a *cazier* document for admin review.
+2. **Profile & listing** – Create a service profile (description, pricing, availability, coverage area).  The listing remains inactive until verification is approved.
+3. **Booking management** – Receive booking requests via push/email; accept or decline within a time window.  Communicate with customers (chat features optional).  Provide services at scheduled times.
+4. **Payment & payout** – After each job, the payout enters escrow for 7 days.  Providers can view upcoming payouts and historical earnings.  Bank details are managed via Stripe Connect.
+5. **Ratings & reviews** – Providers receive customer ratings and respond to feedback.  Repeated low ratings or incidents trigger admin review.
+
+### Admin & Trust & Safety Flow
+
+1. **KYC & *cazier* review** – Admins review provider identity verification results and uploaded *cazier* documents.  Approvals or rejections are recorded; under‑18 or failed verifications are hard‑blocked.
+2. **Booking oversight** – View upcoming bookings, cancellations, no‑shows and completed jobs.  Monitor booking metrics and conversion rates.
+3. **Disputes & refunds** – Handle customer complaints and refund requests during escrow.  Communicate with both parties; decide on refund or partial payout.
+4. **Payout monitoring** – Review pending escrows, payout schedules and release funds after 7 days.  Investigate suspicious activities (fraud, chargebacks).
+5. **Incident management** – Respond to SOS calls or urgent safety issues.  Suspend providers or customers who violate terms.
+6. **Analytics & reporting** – Use PostHog dashboards to monitor KPIs (MAUs, bookings, revenue, churn) and feature flag experiments.
+
+## Backlog: Epics, User Stories & Acceptance Criteria
+
+The backlog is organised into epics.  Each story has a short acceptance criterion (AC).  More detailed acceptance criteria should be maintained in the project management tool.
+
+| **Epic**                        | **User Story (summary)**                                    | **Acceptance Criteria (key points)** |
+|---------------------------------|--------------------------------------------------------------|--------------------------------------|
+| Account & Auth                  | As a user, I can sign up/login with email or OAuth.         | Sign‑up form validates inputs; email verification sends via Resend; login persists session; errors handled gracefully. |
+| Provider KYC                    | As a provider, I must complete ID + selfie verification and upload my *cazier*. | Integration with Stripe Identity (or Sumsub) triggers verification; age < 18 results in denial; uploaded documents stored securely; admin can approve/deny. |
+| Provider Listing                | As a provider, I can create and edit my service profile.    | Fields include description, pricing, availability, coverage area; listing remains inactive until verification approval. |
+| Search & Discovery              | As a customer, I can search and filter providers.            | Search by service, location, date/time; results sorted by distance or rating; map view using Mapbox. |
+| Booking & Payment               | As a customer, I can book a provider and pay securely.      | Booking captures date/time/service details; payment processed via Stripe; booking is confirmed only after provider accepts; funds held in escrow. |
+| Payout & Escrow                 | As a provider, I receive payment 7 days after job completion. | Escrow timer starts when booking is marked complete; refund requests within 7 days cancel payout; after 7 days payout is automatically released via Stripe Connect. |
+| Notifications                   | As a user, I receive notifications about bookings, payments and reviews. | Push via Firebase FCM and email via Resend; notifications respect user language. |
+| Ratings & Reviews              | As a customer, I can rate and review providers.              | Ratings between 1–5 stars; review text optional; provider cannot see rating before leaving their own feedback; aggregated rating updates provider profile. |
+| Admin Dashboard                | As an admin, I can review KYC, manage disputes, and monitor payouts. | Dashboard displays pending verifications, disputes, bookings and payouts; actions (approve/deny, refund) logged; role‑based access control enforced. |
+| Analytics & Feature Flags       | As a product manager, I can track user behaviour and enable features incrementally. | PostHog events are fired at key actions (sign‑up, booking, cancellation); feature flags toggle new features; analytics dashboards show events over time. |
+| Map & ETA                       | As a customer, I can see providers on a map and estimate arrival times. | Mapbox shows provider and customer locations; ETA computed based on distance; directions displayed for providers. |
+| Bot Defence & Security          | As a platform owner, I want to block bots and protect user data. | hCaptcha is required on critical forms; sensitive data (IDs, *cazier*) stored in Supabase storage with access controls; all secrets stored in a credentials vault; GDPR compliance documented. |
+
+## 12‑Week Roadmap
+
+| **Week** | **Tasks** |
+|---------|-----------|
+| **1. Planning & Setup** | Define MVP scope; create GitHub repository; set up Supabase project (Auth, DB schemas, Storage buckets); create Cloudflare Pages and Workers; sign up for Expo EAS, Stripe, Stripe Identity/Sumsub, Firebase, Resend, PostHog, Mapbox, hCaptcha; configure environment variables; initialise React Native and web projects. |
+| **2. Account & Auth** | Implement customer and provider sign‑up/login using Supabase Auth; integrate email verification via Resend; set up basic navigation and state management in the apps. |
+| **3. Provider KYC & Compliance** | Integrate Stripe Identity or Sumsub for ID + selfie verification; design *cazier* upload flow; store KYC results in the database; build admin interface for reviewing KYC; enforce 18+ hard block. |
+| **4. Provider Profiles & Listings** | Allow verified providers to create and update service profiles; store pricing, availability and location; build public listing pages; implement admin approval for listings. |
+| **5. Booking & Payment** | Implement search and booking flow; integrate Stripe Payments & Connect; create Payment Intents; charge customer and hold funds in escrow for 7 days; show booking status. |
+| **6. Payout & Escrow Logic** | Configure Stripe Connect payout schedule (7‑day delay); implement refund logic within escrow window; show payout schedule to providers; handle cancellations. |
+| **7. Notifications & Communications** | Integrate Firebase FCM for push notifications; set up Resend for transactional emails; implement booking acceptance/decline notifications; add chat or messaging if time permits. |
+| **8. Ratings & Reviews** | Build rating and review components; store reviews in the database; display aggregated ratings; prevent rating abuse; handle anonymous feedback if required. |
+| **9. Admin Dashboards** | Develop admin dashboard for KYC/cazier review, dispute resolution, refunds, payout management and incident reports; integrate PostHog analytics; ensure role‑based access control. |
+| **10. Map & ETA Features** | Integrate Mapbox for maps and geocoding; show provider/customer locations; calculate estimated arrival times; improve UI for location selection. |
+| **11. Analytics & Feature Flags / QA Testing** | Instrument key events in PostHog; set up feature flags for experimental features; run comprehensive tests (unit, integration, user acceptance); verify 7‑day payout delay end‑to‑end in Stripe’s test mode; fix bugs. |
+| **12. Launch Prep & Cleanup** | Finalise legal documents (Terms, Privacy, Acceptable Use); configure production domains; add VAT logic off toggle (disabled); run security review and DPIA; unsubscribe from unused trials; prepare marketing material; launch the app; monitor early metrics. |
+
+## Vendor Integration & Cost Estimate
+
+The table below summarises the selected vendors, free/trial allowances and estimated costs for the MVP.  Estimated costs assume approximately 50 bookings and ~30 provider verifications during the MVP period.  Actual costs may vary; contingency is included to stay under **€1,000**.
+
+| **Vendor**            | **Role & Free/Trial Features** | **Expected Cost for MVP** | **Notes** |
+|-----------------------|---------------------------------|---------------------------|-------------|
+| **Supabase**          | Backend (Auth, DB, Storage, Functions).  Free plan includes 50K MAUs, 500 MB database, 1 GB file storage, 5 GB egress and unlimited API requests【706800386041896†L29-L45】. | €0 (within free tier) | Will upgrade to Pro (€25/month) if usage exceeds free limits. |
+| **Cloudflare Pages & Workers** | Host web frontend and API functions.  Free plan: 500 builds/month & unlimited static requests【979951865825826†L149-L159】; Workers free plan: 100k requests/day, 5 GB storage【234626163730621†L262-L274】. | €0 | Future scale may require Workers Paid Plan (~$0.30 per million requests). |
+| **Expo EAS**          | Build and deploy mobile app.  Free plan: 30 builds/month, 1,000 MAU limit【719596553013469†L12-L23】. | €0 | Consider Starter plan ($19/month) if build limit or MAU cap exceeded. |
+| **Stripe Payments & Connect** | Process payments, hold funds and release payouts.  RON is supported and minimum charge is ~2 RON【155163300266708†L300-L452】; payout delay configurable to 7 days【670833047180860†L96-L114】. | **~€100** | Fees: ~1.4% + fixed fee per transaction.  For 50 bookings of ~€10 each, total fees ~€17; allocate €100 contingency for higher volume. |
+| **Stripe Identity**    | Identity verification (ID + selfie).  Charges per verification (approx. $1.50/€1.4). | **~€45** | Use for ~30 provider verifications; switch to Sumsub after free 50 verifications if needed. |
+| **Firebase FCM & Crashlytics** | Push notifications & crash reporting.  Free on all plans【148027503937966†L288-L297】【148027503937966†L334-L337】. | €0 | |
+| **Resend**            | Email delivery.  Free plan: 3,000 emails/month, 100/day, 1 domain【374439326967200†L35-L45】. | €0 | Upgrade to Pro ($20/month) if email volume increases. |
+| **PostHog**           | Analytics & feature flags.  Free tier: 1 M events, 5k session replays, 1 project, one‑year retention【224060230915803†L44-L99】. | €0 | Plan upgrades after scaling. |
+| **Mapbox**            | Maps & geocoding.  Free tier: 200k tiles/month (~10k map views) and 100k geocodes【145825556112903†L15-L49】【145825556112903†L71-L76】. | €0 | Sufficient for MVP; pay‑as‑you‑go pricing after free tier. |
+| **hCaptcha**          | Bot defence for forms.  Basic (free) plan: up to 100k requests/month【344031017633751†L20-L31】. | €0 | |
+| **Twilio (optional)** | Masked phone calls/SMS.  Proxy API beta closed【33796042004383†L66-L80】; use Twilio Conversations or skip for MVP. | €0 | Leave out for MVP to stay within budget; add later if necessary. |
+
+**Total estimated cost:** ~€145 (primarily Stripe fees and provider verifications), leaving ample buffer under the €1,000 budget.
+
+## Security & DPIA Checklist
+
+1. **Data minimisation & storage**
+   * Store only necessary personal data; encrypt at rest and in transit.
+   * Supabase Storage holds ID images and *cazier* documents; access restricted to authorised functions and admins.
+   * Use environment variables and a credentials vault (e.g., GitHub Secrets + Supabase secrets) to store API keys and secrets.
+
+2. **Identity & age verification**
+   * Integrate Stripe Identity or Sumsub for KYC; ensure providers are ≥ 18 years old【163070271008718†L48-L53】.
+   * Delete biometric data after verification or within the vendor’s retention period.
+
+3. **Escrow & payout delay**
+   * Configure Stripe Connect `delay_days=7` to hold funds for 7 days【670833047180860†L96-L114】.
+   * Implement logic to prevent manual payout changes without admin approval.
+
+4. **PII isolation & GDPR compliance**
+   * Provide a privacy notice detailing data collection, use, and retention; obtain explicit consent.
+   * Allow users to download or delete their data (Subject Access Requests) via self‑service or support.
+   * Process data within the EU or adequate jurisdictions; ensure cross‑border transfers comply with GDPR.
+
+5. **Security controls**
+   * Use HTTPS across the platform; enable HSTS in Cloudflare.
+   * Implement Content Security Policy (CSP) and other headers (X‑Frame‑Options, X‑Content‑Type‑Options).
+   * Rate‑limit APIs via Cloudflare to mitigate DDoS; use hCaptcha on form endpoints【344031017633751†L20-L31】.
+   * Regularly update dependencies and audit code for vulnerabilities.
+
+6. **Incident management**
+   * Provide an SOS button in the app; notify admin via push/email when triggered.
+   * Define escalation paths and contact information for emergencies.
+
+7. **Auditing & logging**
+   * Log all sensitive operations (KYC approvals, payouts, refunds) with timestamps and admin IDs.
+   * Store logs securely and rotate them regularly.
+
+## Scaling Plan (Post‑MVP)
+
+After the MVP launch, the platform should scale to support multiple currencies, countries and VAT handling:
+
+1. **Multi‑currency & multi‑country support**
+   * Refactor pricing and payment tables to include currency codes and exchange rates; use Stripe’s multi‑currency features.
+   * Add localisation files for additional languages; integrate i18n library in both web and mobile clients.
+   * Introduce region‑based tax rules and compliance logic; store VAT numbers for providers.
+
+2. **VAT & invoicing**
+   * Once VAT registration is complete, configure Stripe to collect VAT on applicable transactions; generate invoices with VAT breakdown.
+   * Provide VAT invoices to customers via email (Resend) and account dashboard.
+
+3. **Automated dispute & refund handling**
+   * Implement self‑service refund flows; allow customers to cancel bookings and track status.
+   * Automate dispute detection using PostHog event anomalies.
+
+4. **Provider marketplace enhancements**
+   * Add categories (cleaning, babysitting, tutoring, etc.); allow providers to set dynamic pricing and special offers.
+   * Introduce subscription or membership models for frequent customers.
+
+5. **Infrastructure scale**
+   * Move heavy workloads to Cloudflare Workers or dedicated serverless functions; use Supabase Pro plan or dedicated Postgres for increased traffic.
+   * Implement caching (Cloudflare KV/Durable Objects) for frequently accessed data.
+
+6. **Automation & DevOps**
+   * Extend CI/CD pipelines to run automated tests, security scans and deploy to multiple regions.
+   * Use infrastructure‑as‑code (e.g., Terraform) for reproducible environments.
+
+## CI/CD Pipelines
+
+GitHub Actions will orchestrate the build and deployment workflow:
+
+1. **Repository structure** – separate folders for web, mobile and serverless functions; shared configuration files (.env.example).  Use conventional commits for semantic versioning.
+2. **Secrets management** – store API keys (Stripe, Supabase, Mapbox, Firebase, Resend) in GitHub Secrets; do not commit secrets to the repository.
+3. **Build & test** – on each push, run unit tests and linting.  If branch is `main` or `release`, build the web app and deploy to Cloudflare Pages via the official GitHub Action.  For mobile, trigger Expo EAS build via EAS GitHub Action (requires configured EAS tokens).
+4. **Supabase migrations** – commit SQL migrations to a `supabase` directory; run `supabase db push` in CI to update the database; deploy Edge Functions via `supabase functions deploy`.
+5. **Continuous monitoring** – integrate PostHog to record deployment events and measure performance metrics; use Firebase Crashlytics to capture runtime errors.
+
+## Testing & Cleanup
+
+* **Sandbox testing** – Use Stripe’s test mode to simulate bookings, payments, escrow, refunds and 7‑day payout delays.  Confirm that funds are not released until the 7‑day period ends and that refunds cancel the payout.
+* **KYC testing** – Run sample identity verifications with test documents; verify that under‑age providers are blocked.
+* **Push & email** – Test FCM and Resend to ensure notifications arrive in both languages; verify unsubscribed users do not receive messages.
+* **Load testing** – Simulate concurrent bookings to ensure Cloudflare and Supabase can handle expected load; monitor response times.
+* **Trial cleanup** – At the end of MVP development, unsubscribe from any unused paid services or trials (e.g., Mapbox high‑usage plan, EAS paid plan).  Delete test data and revoke unused API keys.
+
+## URLs & Setup Notes
+
+Below are the signup links and brief setup notes for each service (free plans unless stated).  Use a credential vault (e.g., 1Password or AWS Secrets Manager) to store the API keys.
+
+| **Service** | **URL & Setup Notes** |
+|------------|----------------------|
+| **Supabase** | https://supabase.com – create a free project; enable email OTP or OAuth; configure the “Storage” bucket for document uploads; set up Edge Functions for business logic. |
+| **Cloudflare Pages & Workers** | https://dash.cloudflare.com/pages – connect GitHub repository; deploy static frontend; create Workers for serverless APIs; configure environment variables via Cloudflare Secrets. |
+| **Expo EAS** | https://expo.dev/eas – register and link GitHub; install EAS CLI; define build profiles; configure FCM for Android and APNs for iOS. |
+| **Stripe & Stripe Identity** | https://dashboard.stripe.com – create a Stripe account; enable Connect and set payout delay to 7 days; enable Identity verification and configure government ID + selfie checks; verify test payouts in sandbox. |
+| **Sumsub (alternative)** | https://dashboard.sumsub.com – sign up for a 14‑day trial with 50 free checks【788287205031948†L22-L117】; configure KYC flows; integrate via API if needed; compare cost to Stripe Identity. |
+| **Firebase** | https://firebase.google.com – create a project; enable Cloud Messaging and Crashlytics; obtain service account credentials; install FCM SDK in the app. |
+| **Resend** | https://resend.com – sign up for a free account; verify domain for sending email; obtain API key; integrate via REST API or official SDK. |
+| **PostHog** | https://posthog.com – sign up for a free cloud account; create a project; obtain API key; implement client SDKs in web and mobile; use feature flags for new functionality. |
+| **Mapbox** | https://account.mapbox.com – create an account; obtain public token; use Directions and Geocoding APIs.  Respect usage limits to stay within free tier. |
+| **hCaptcha** | https://dashboard.hcaptcha.com – sign up for Basic plan; register site keys for web and mobile forms; configure challenge appearance (in Romanian/English). |
+| **Twilio (optional)** | https://www.twilio.com – if masked phone calls are required post‑MVP, create a Twilio account; consider using Twilio Conversations or Programmable Voice as Proxy API is closed【33796042004383†L66-L80】. |
+
+## Conclusion
+
+This MVP plan delivers a fully functional cleaning and babysitting marketplace tailored to the Romanian market, meeting the budget (€1,000), timeline (12 weeks) and key business rules.  By leveraging free tiers and managed services, the platform minimises operational costs while remaining scalable.  Post‑MVP enhancements (multi‑currency, VAT, multi‑country, automation) are planned without requiring major architectural changes.  Regular status updates, CI/CD pipelines, and security best practices ensure transparency and reliability throughout development.
